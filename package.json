@@ -18,8 +18,8 @@
   "license": "GPL v2",
   "dependencies": {
     "checksum": "0.1.1",
-    "gulp-replace": "0.5.4",
-    "request": "2.65.0"
+    "gulp-replace-async": "0.0.1",
+    "promise": "7.0.4"
   },
   "scripts": {
     "test": "mocha"

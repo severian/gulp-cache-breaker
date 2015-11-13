@@ -1,54 +1,90 @@
-var replace = require('gulp-replace');
+var replace = require('gulp-replace-async');
 var path = require('path');
 var fs = require('fs');
 var checksum = require('checksum');
-var request = require('request');
+var Promise = require('promise');
 
 // Match {{cache-break:path/to/resource}}
 var reCacheBreak = /{{cache-break:(.+?)}}/g;
 
-// Match http://, https:// or // to indicate that the resource lies external
-// the the project.
-var reExternal = /^(?:https?:)?\/\//;
+// Match {{cdn-path:path/to/resource}}
+var reCdnPath = /{{cdn-path:(.+?)}}/g;
 
-var reLeadingSlash = /^\/+/;
+var readFile = Promise.denodeify(fs.readFile);
+var stat = Promise.denodeify(fs.stat);
 
-function cacheBreakPath(base, resource) {
-    var qs;
-    var time = Date.now();
+function mkPath(resource, cs) {
+  var dirname = path.dirname(resource);
+  var extname = path.extname(resource);
+  var basename = path.basename(resource, extname);
 
-    // If we're not dealing with an external file and the file exists, let's
-    // get ourselves a checksum of the file's contents
-    if(!reExternal.test(resource)) {
-      // Since we know it's not external, we interpret the path as relative from
-      // the specified base.  This means that in order to determine the full path
-      // correclty we'll need to remove a single leading slash.
-      var fullPath = path.resolve(base, resource.replace(reLeadingSlash, ''));
-      if(fs.existsSync(fullPath)) {
-        qs = checksum(fs.readFileSync(fullPath));
-      }
-    }
-
-    // Fallback to the current timestamp
-    if(!qs) {
-      qs = time;
-    }
-
-    // Play well with an existing query-string
-    return resource + (resource.indexOf('?') === -1 ? '?' : '&') + 'cb=' + qs;
+  return path.join(dirname, basename + '.' + cs.substring(0, 10) + extname);
 }
 
-module.exports = function(base) {
-  base = base && path.resolve(base);
+function CacheBreaker() {
+  this.checksumCache = {};
+}
 
-  if(!base) {
-    base = process.cwd();
-  }
+CacheBreaker.prototype.cacheBreakPath = function(base, resource) {
+  base = base || process.cwd();;
 
-  return replace(reCacheBreak, function(match, resource) {
-    return cacheBreakPath(base, resource);
-  });
+  var joinedPath = path.join(base, resource);
+  var fullPath = path.resolve(joinedPath);
+
+  return stat(fullPath).then(function(s) {
+    var mtime = s.mtime.getTime();
+    if (fullPath in this.checksumCache && mtime === this.checksumCache[fullPath].mtime) {
+      var cs = this.checksumCache[fullPath].checksum;
+      return mkPath(resource, fullPath);
+    } else {
+      return readFile(fullPath).then(function(file) {
+        var cs = checksum(file);
+        this.checksumCache[fullPath] = { checksum: cs, mtime: mtime };
+        return mkPath(resource, fullPath);
+      }.bind(this));
+    }
+  }.bind(this));
+
 };
 
-module.exports.cacheBreakPath = cacheBreakPath;
+CacheBreaker.prototype.cdnUri = function(base, resource, host) {
+  if (host) {
+    return this.cacheBreakpath(base, resource).then(function(path) {
+      return 'https://' + host + path;
+    });
+  } else {
+    return this.cacheBreakPath(base, resource);
+  }
+};
+
+CacheBreaker.prototype.gulpCbPath = function(base) {
+  return replace(reCacheBreak, function(match, callback) {
+    this.cacheBreakPath(base, match[1]).then(function(path) {
+      callback(null, path);
+    });
+  }.bind(this));
+};
+
+CacheBreaker.prototype.gulpCdnUri = function(base, host) {
+  return replace(reCdnPath, function(match, callback) {
+    this.cdnUri(base, match[1], host).then(function(path) {
+      callback(null, path);
+    });
+  }.bind(this));
+};
+
+CacheBreaker.prototype.symlinkCbPaths = function() {
+  Object.keys(this.checksumCache).forEach(function(fullPath) {
+    var cbPath = mkPath(fullPath, this.checksumCache[fullPath].checksum);
+    try {
+      fs.symlinkSync(path.basename(fullPath), cbPath);
+    } catch (e) {
+      if (e.code !== 'EEXIST') {
+        throw e;
+      }
+    }
+  }.bind(this));
+};
+
+module.exports = CacheBreaker;
 
